@@ -1,0 +1,1031 @@
+-- ------------------------------------------------------
+-- Title: Multi Probe PWR/SWR meter
+--
+-- Author: Pavel Milanes pavelmc@gmail.com, 2017
+--
+-- License: GNU GPL 3.0
+--
+-- Compiler: 2.4q2
+--
+-- Description:
+--  Multi probe PWR/SWR meter
+--
+--
+-- ------------------------------------------------------
+--             Rough pinout for PIC16F887
+-- ------------------------------------------------------
+--
+--           MCLR > [1         40] <> RB7 DAT
+--  DIR ADC > AN0 > [2         39] <> RB6 CLK
+--  REV ADC > AN1 > [3         38] <> RB5 en  | LCD interface
+--  PROBE ID  AN2 > [4         37] <> RB4 rs  |
+--     SCALE  AN3 > [5         36] <> RB3 d7  |
+--           RA4 <> [6         35] <> RB2 d6  |
+--            AN4 > [7         34] <> RB1 d5  |
+--            AN5 > [8         33] <> RB0 d4  |
+--            AN6 > [9         32] = VDD
+--            AN7 > [10        31] = GND
+--            VDD = [11        30] <> RD7
+--            GND = [12        29] <> RD6
+--          XTAL0 > [13        28] <> RD5
+--          XTAL1 > [14        27] <> RD4
+--           RC0 <> [15        26] <> RC7 / RX
+--           RC1 <> [16        25] <> RC6 / TX
+--           RC2 <> [17        24] <> RC5
+--           RC3 <> [18        23] <> RC4
+--    B_mode RD0 <> [19        22] <> RD3 B_extra
+--    B_up   RD1 <> [20        21] <> RD2 B_down
+
+
+include 16f887                      -- target PICmicro
+--
+pragma target clock 14_318_180      -- oscillator frequency
+pragma target OSC HS                -- HS crystal or resonator
+pragma target WDT      CONTROL      -- watchdog
+pragma target LVP  disabled         -- no low voltage programming
+pragma target MCLR external
+WDTCON_SWDTEN = OFF                 -- disable WDT
+
+enable_digital_io()
+
+-- LCD setting
+const byte LCD_ROWS    =  2           -- LCD with 2 lines
+const byte LCD_CHARS   =  20          -- and 20 characters per line
+
+alias     lcd_en       is pin_B4
+alias     lcd_rs       is pin_B5
+pin_B4_direction       = output
+pin_B5_direction       = output
+
+alias     lcd_d4       is pin_B0
+alias     lcd_d5       is pin_B1
+alias     lcd_d6       is pin_B2
+alias     lcd_d7       is pin_B3
+portB_low_direction    = all_output
+
+include lcd_hd44780_4
+lcd_init()
+
+-- alias de los botones
+alias b_mode  is pin_D0
+alias b_down  is pin_D2
+alias b_up    is pin_D1
+alias b_tune  is pin_D3
+portD_low_direction = all_input
+
+
+-- Icom rutines
+alias istart     is pin_D4
+alias ikey       is pin_D5
+alias trx_ptt    is pin_D6
+pin_D4_direction = output
+pin_D5_direction = input
+pin_D6_direction = output
+
+
+--definir los caracteres nuevos
+-- a 1 makes a pixel dark ; only lower 5 bits are meaningfull (5x7 + underscore)
+-- se asume que siempre la barra superior será mayor o igual a la inferior
+const byte u1d0[] = {
+0b_00011000,
+0b_00011000,
+0b_00011000,
+0b_00000000,
+0b_00000000,
+0b_00000000,
+0b_00000000,
+0b_00000000
+}
+
+const byte u1d1[] = {
+0b_00011000,
+0b_00011000,
+0b_00011000,
+0b_00000000,
+0b_00011000,
+0b_00011000,
+0b_00011000,
+0b_00000000
+}
+
+
+const byte u2d0[] = {
+0b_00011011,
+0b_00011011,
+0b_00011011,
+0b_00000000,
+0b_00000000,
+0b_00000000,
+0b_00000000,
+0b_00000000
+}
+
+const byte u2d1[] = {
+0b_00011011,
+0b_00011011,
+0b_00011011,
+0b_00000000,
+0b_00011000,
+0b_00011000,
+0b_00011000,
+0b_00000000
+}
+
+const byte u2d2[] = {
+0b_00011011,
+0b_00011011,
+0b_00011011,
+0b_00000000,
+0b_00011011,
+0b_00011011,
+0b_00011011,
+0b_00000000
+}
+
+lcd_define(1, u1d0)
+lcd_define(2, u1d1)
+lcd_define(3, u2d0)
+lcd_define(4, u2d1)
+lcd_define(5, u2d2)
+
+-- delay
+include delay
+
+-- print
+include print
+
+-- format
+include format
+
+-- set all pins as digital, before setting the analog ones
+enable_digital_io()
+
+-- ADC
+const bit ADC_HIGH_RESOLUTION = high
+const byte ADC_NVREF = ADC_NO_EXT_VREF
+include adc
+adc_init()
+
+-- set analog pins
+set_analog_pin(0)   -- FWD
+set_analog_pin(1)   -- REV
+set_analog_pin(2)   -- PROBE ID
+
+-- setup the timer0_isr_interval library
+const word timer0_isr_rate = 1000  -- 1 kHz isr rate
+const DELAY_SLOTS = 2
+include timer0_isr_interval
+timer0_isr_init()
+
+-- debounce
+include debounce
+
+-- internal eeprom
+include pic_data_eeprom
+
+-- Configure PWM
+pin_ccp1_direction = output
+include pwm_hardware
+pwm_max_resolution(1)   -- max ~ 13 Khz
+pwm1_off()
+pwm2_off()
+
+-- Setup serial
+-- baudrate 8N1 as default
+const serial_hw_baudrate    = 115200
+include serial_hardware
+serial_hw_init()
+
+
+-- variables
+-- como se lee del ADC
+var word ffwd           = 0     -- valor de la lectura del encendido del diodo
+var word frev           = 0     -- valor de la lectura del encendido del diodo
+-- ADC raw values
+var word rfwd           = 0     -- voltaje fwd como se lee del ADC
+var word rrev           = 0     -- voltaje rev como se lee del ADC
+-- voltage real
+var dword vfwd          = 0     -- voltaje real en mv
+var dword vrev          = 0     -- voltaje real en mv
+-- instantaneous power
+var dword pfwd          = 0     -- Potencia directa en 3 decimales (100.5W = 100500)
+var dword prev          = 0     -- Potencia reflejada en 3 decimales (3.25W = 3250)
+-- samples for the average
+const byte samples      = 10
+-- arrays para rms
+var dword avf[samples]
+var dword avr[samples]
+-- rms values
+var dword rmsvf
+var dword rmsvr
+var dword rmsfwd
+var dword rmsrev
+-- pep values
+var dword pepvf
+var dword pepvr
+var dword pepfwd
+var dword peprev
+
+-- SWR
+var word swr = 0                -- valor del swr 1:2.51 ~ 2.51 ~ 251\
+-- variables para la barra
+var byte barra
+var byte bar_offset = 5
+-- max power
+var dword maxpower
+-- mode and others
+var byte mode = 0               -- 0 = PEP; 1 = RMS ; 2 = SWR
+-- max swr a mostrar en display
+var word swr_display = 800      -- 8.00
+
+
+-- Probe details
+var word probe_gain[6] = {16_550, 1, 1, 1, 1, 1} -- it will be / 1000 ahead.
+-- numero de la sonda
+var byte probe = 0
+        -- Probe id, is the ADC value / 200 so 0 to 5
+        -- 0 is HF (Bruene)
+        -- 1 is VHF (Microstrip)
+        -- 2 is not used
+        -- 3 is not used
+        -- 4 is not used
+        -- 5 no probe present
+
+-- temp vars
+var byte i          -- the venerable iterator
+
+-- alc value
+var word alcval = 0
+
+--flags
+var bit show_no_probe = 1
+var bit alc_control = 0
+
+-- counter de los botones
+const byte DBT = 25
+var word modest = debounce_init(DBT)
+var word upst = debounce_init(DBT)
+var word downst = debounce_init(DBT)
+var word tunest = debounce_init(DBT)
+var word ikeyst = debounce_init(DBT)
+
+
+-- eliminar el offset del cálculo
+function fixOffset(word in value, word in offset) return word is
+    -- seleccionando el offset correcto
+    if value > offset then
+        return value - offset
+    else
+        return 0
+    end if
+end function
+
+
+-- procedimiento para calcular el valor del ADC a mV
+function tomv(word in adcin) return dword is
+    var dword long
+
+    -- Calcular valor de Vreal en la carga
+    long = adcin
+    -- multiplicarlo por la constante de mv*unidad
+    long = (long * 4888 ) / 1000
+    -- ya está en mv, ahora allar el valor real
+    -- con la perdida de la sonda
+    long = (long * probe_gain[probe]) / 1000
+
+    -- retornar el valor
+    return long
+end function
+
+
+-- calcular la potencia
+function topwr(dword in vin) return dword is
+    -- variable realmente grande para el cálculo
+    var byte*5 p
+    p = vin
+    p = p * vin
+    p = p / 50_000
+    return dword(p)
+end function
+
+
+-- calcular el SWR los valors de voltage son en dependencia del modo
+function toswr() return word is
+    var word result
+
+    -- verificar que halla potencia
+    if (vfwd < 100) then
+        result = 100
+    else
+        var dword tlsuma
+        var dword tlresta
+
+        case mode of
+        0,1:
+            block
+                tlsuma = pepvf + pepvr
+                tlresta = pepvf - pepvr
+            end block
+        2:
+            block
+                tlsuma = vfwd + vrev
+                tlresta = vfwd - vrev
+            end block
+    end case
+
+        result = word((tlsuma * 100) / tlresta)
+    end if
+
+    return result
+end function
+
+
+procedure pushvf(dword in val) is
+    pragma inline
+    -- correr el valor en el array y hacer un push al final
+    var dword tlong = 0
+    i = 0
+    pepvf = val
+    tlong = val
+
+    for (samples - 1) loop
+        -- push del nuevo valor
+        avf[i] = avf[i + 1]
+        -- pep
+        if avf[i] > pepvf then
+            pepvf = avf[i]
+        end if
+        -- average
+        tlong = tlong + avf[i]
+        -- iterator
+        i = i + 1
+    end loop
+    avf[samples - 1] = val
+
+    -- calcular la media y el pep
+    rmsvf = tlong / samples
+end procedure
+
+
+procedure pushvr(dword in val) is
+    pragma inline
+    -- correr el valor en el array y hacer un push al final
+    var dword tlong = 0
+    i = 0
+    pepvr = val
+    tlong = val
+
+    for (samples - 1) loop
+        -- push del nuevo valor
+        avr[i] = avr[i + 1]
+        -- pep
+        if avr[i] > pepvr then
+            pepvr = avr[i]
+        end if
+        -- average
+        tlong = tlong + avr[i]
+        -- iterator
+        i = i + 1
+    end loop
+    avr[samples - 1] = val
+
+    -- calcular la media y el pep
+    rmsvr = tlong / samples
+end procedure
+
+
+-- procedimiento para imprimir a escala los valores
+procedure print_scale(dword in value) is
+    -- Es para escalar las mejor resolución según el valor enviado, mostrando algo como esto...
+    --  "23 mW" / "675mW" / "1.56W" / "9.75W" / "12.5W" / "50.4W" / "100 W"  / "145 W"
+    -- Siempre se usarán solo 5 lugares para poner la potencia "01234"
+
+    -- usamos dos variables para representar el escalado a la hora del print y un divisor
+    -- estos son los valores por defecto si no es mayor que los ifs siguientes
+    var byte decimales = 0
+    var word divisor = 1
+
+    if value > 990 then
+        -- 0.99W / 1.00W / 5.75W
+        decimales = 2
+        divisor = 10
+    end if
+
+    if value > 9900 then
+        -- 9.9W / 12.5W / 50.4W / 99.9W
+        decimales = 1
+        divisor = 100
+    end if
+
+    if value > 99900 then
+        --  100 W  /  160 W
+        decimales = 0
+        divisor = 1000
+    end if
+
+    -- imprimir el resultado
+    value = value / divisor
+    format_dword_dec(lcd, value, 3, decimales)
+    -- poner la unidad
+    if divisor == 1 then
+        -- poner " mW"
+        print_string(lcd, "mW")
+    else
+        -- poner "W"
+        if decimales == 0 then
+            -- si no hay comas pongo un espacio
+            print_string(lcd, " ")
+        end if
+
+        print_string(lcd, "W")
+    end if
+end procedure
+
+
+procedure show_it() is
+    -- special case 0: no probe, no message displayed
+    if (probe == 5 & show_no_probe == 0)then
+        -- reset flag
+        show_no_probe = 1
+
+        -- clear screen
+        lcd_clear_screen()
+        lcd_cursor_position(0,0)
+        print_string(lcd, " NO PROBE DETECTED! ")
+        lcd_cursor_position(1,0)
+        print_string(lcd, " Please, attach one ")
+
+        -- return
+        return
+    end if
+
+    -- special case 1: no probe message displyed
+    if (probe == 5) then
+        -- just return, nothing to do here
+        return
+    end if
+
+    -- normal, main action goes here:
+
+    -- update the LCD (Second Line, first is Bar)
+    --
+    --  "01234567890123456789"
+    --  "1.12 |||||||||||||||"
+    --  "P F: 12.5W  R: 12.5W"
+    --
+
+    -- principio de primera linea
+    lcd_cursor_position(0,0)
+    -- ok or bad
+    if (swr > 999) then
+        -- se pasa, mucha ROE
+        print_string(lcd, "> 10")
+    else
+        format_word_dec(lcd, swr, 3, 2)
+    end if
+
+    -- segunda linea
+    lcd_cursor_position(1,0)
+    -- mode
+    case mode of
+        0:  lcd = "P"
+        1:  lcd = "R"
+        2:  lcd = "S"
+    end case
+    -- separator
+    lcd = 32    -- " "
+    -- FORWARD
+    print_string(lcd, "F: ")
+    case mode of
+        0:  print_scale(pepfwd)
+        1:  print_scale(rmsfwd)
+        2:  print_scale(pepfwd)
+    end case
+    -- separator
+    lcd = 32    -- " "
+    -- REVERSE
+    print_string(lcd,"R: ")
+    case mode of
+        0:  print_scale(peprev)
+        1:  print_scale(rmsrev)
+        2:  print_scale(peprev)
+    end case
+end procedure
+
+
+procedure lcd_dual_bar(byte in up, byte in lo, byte in line) is
+    pragma inline
+    -- upper must always equal or bigger than lower
+    var byte level = 0
+    var byte u
+    var byte l
+    var byte temp
+
+    -- set the LCD line
+    lcd_cursor_position(line, bar_offset)
+
+    for (LCD_CHARS - bar_offset) loop
+        -- reset de variables
+        u = 0
+        l = 0
+
+        -- iterator
+        level = level + 2
+
+        -- tests UP
+        temp = level - 2
+        if up > temp then
+            u = 1
+        end if
+        if up >= level then
+            u = 2
+        end if
+        -- test down
+        if lo > temp then
+            l = 1
+        end if
+        if lo >= level then
+            l = 2
+        end if
+
+        temp = u << 2
+        temp = temp + l
+
+        case temp of
+            0:  lcd = 32
+            4:  lcd = byte(1)     -- u1d0
+            5:  lcd = byte(2)     -- u1d1
+            8:  lcd = byte(3)     -- u2d0
+            9:  lcd = byte(4)     -- u2d1
+            10: lcd = byte(5)     -- u2d2
+        end case
+    end loop
+end procedure
+
+
+procedure show_bar() is
+    pragma inline
+    -- define vars
+    var byte upper
+    var byte lower
+    var word temp
+
+    -- calc scaled factor
+    temp = word(maxpower / ((LCD_CHARS - bar_offset) * 2))
+
+    -- calculate the upper and lower values
+    case mode of
+        0:  block   -- PEP
+                upper = byte(pfwd/temp)
+                lower = byte(prev/temp)
+            end block
+        1:  block   -- RMS
+                upper = byte(rmsfwd/temp)
+                lower = byte(rmsrev/temp)
+            end block
+        2: block    -- SWR
+                if (swr - 100) >= swr_display then
+                    lower = (LCD_CHARS - bar_offset) * 2
+                else
+                    -- new scale factor
+                    temp = swr_display / ((LCD_CHARS - bar_offset) * 2)
+                    lower = byte((swr - 100)/temp)
+                end if
+                -- ambas barras iguales
+                upper = lower
+            end block
+    end case
+
+    -- asegurar que siempre se muestre las dos barras iniciales
+    if upper == 0 then
+        upper = 1
+    end if
+    if lower == 0 then
+        lower = 1
+    end if
+
+    -- show the bar
+    lcd_dual_bar(upper, lower, 0)
+
+end procedure
+
+
+-- power calculations
+procedure calc_power() is
+    -- leer los valores del ADC
+    rfwd = adc_read_high_res(0)
+    rrev = adc_read_high_res(1)
+
+    -- convertirlos a mv
+    vfwd = fixOffset(rfwd, ffwd)
+    vfwd = tomv(word(vfwd))
+    vrev = fixOffset(rrev, frev)
+    vrev = tomv(word(vrev))
+
+    -- calcular el average
+    pushvf(vfwd) -- se almacena en rmsvf
+    pushvr(vrev) -- se almacena en rmsvr
+
+    -- calcular el power instantáneo
+    pfwd = topwr(vfwd)
+    prev = topwr(vrev)
+
+    -- calcular el power RMS
+    rmsfwd = topwr(rmsvf)
+    rmsrev = topwr(rmsvr)
+
+    -- calcular el power PEP
+    pepfwd = topwr(pepvf)
+    peprev = topwr(pepvr)
+
+    -- calcular el SWR, usando los valores según el modo
+    swr = toswr()
+end procedure
+
+
+-- calc the max value of the power for the probe and show it on the LCD
+procedure calcmp() is
+    -- calc max power
+    maxpower = topwr(tomv(1023 - ffwd))
+
+    -- print it
+    print_string(lcd, "Max PWR: ")
+    format_dword_dec(lcd, (maxpower/100), 4, 1)
+    print_string(lcd, " W")
+end procedure
+
+
+-- mostrar el SETUP del LCD_CHARS
+procedure show_setup() is
+    pragma inline
+    -- en la linea 1
+    lcd_cursor_position(0, 0)
+    print_string(lcd,"SETUP | Probe Gain: ")
+    format_word_dec(lcd, probe_gain[probe], 5, 3)
+    lcd = 32    -- " "
+    calcmp()
+end procedure
+
+
+-- save probe gain
+procedure save_probe_gain() is
+    -- first byte is fingerprint [0]
+    -- Probe data is from byte 1 and forward
+    -- each block is of 4 bytes long
+    -- so position is (probe *  4 ) + 1
+    --
+    -- Formato de los datos en la eeprom
+    -- 0: byte(modo)
+    -- 1: word(probe_gain)
+    --
+    var word pos = (probe * 4)  + 1
+    data_eeprom_write(pos, mode)
+    data_eeprom_write_word(probe + 1, probe_gain[probe])
+end procedure
+
+
+-- load probe data
+procedure load_probe_gain() is
+    pragma inline
+    -- see save_probe_data for format explanation
+    var word pos = (probe * 4)  + 1
+    data_eeprom_read(pos, mode)
+    data_eeprom_read_word(probe + 1, probe_gain[probe])
+end procedure
+
+
+-- initialize eeprom
+procedure init_eeprom() is
+    pragma inline
+    data_eeprom_read(0, i)  -- using global iterator as temp var
+
+    -- lcd position
+    lcd_cursor_position(1,0)
+
+    if i != 24 then
+        -- do init it
+        save_probe_gain()
+        data_eeprom_write(0, 24)
+        -- LCD activity
+        print_string(lcd, "INITIALIZING EEPROM ")
+    else
+        --load eeprom data
+        load_probe_gain()
+        -- LCD activity
+        print_string(lcd, "Probe: ")
+        format_byte_dec(lcd, probe, 1, 0)
+        print_string(lcd, " LOAD EEPROM")
+    end if
+
+    -- delay for LCD read (3s)
+    delay_100ms(30)
+end procedure
+
+
+-- pep array reset
+procedure pep_array_reset() is
+    pragma inline
+    for samples using i loop
+        avf[i] = 0
+        avr[i] = 0
+    end loop
+end procedure
+
+
+-- test the probe
+function test_probe() return byte is
+    -- determine what probe is attached
+    i = byte(adc_read_high_res(2) / 200)
+
+    -- flag reset
+    if (i < 5) then
+        -- valid probe
+        show_no_probe = 0
+    end if
+
+    -- return
+    return i
+end function
+
+
+-- actions for a probe change
+procedure probe_changed() is
+    -- LCD activity
+    lcd_clear_screen()
+    lcd_cursor_position(0,0)
+    print_string(lcd, "CO7WT SWR/PWR v 1.0 ")
+
+    -- prep the array for pep power
+    pep_array_reset()
+
+    -- read adc bias values for the diodes
+    ffwd = adc_read_high_res(0)
+    frev = adc_read_high_res(1)
+
+    -- show max power
+    lcd_cursor_position(1,0)
+    calcmp()
+
+    -- delay to read
+    delay_100ms(25)
+    lcd_clear_screen()
+end procedure
+
+
+-- setup operation
+procedure in_setup() is
+    pragma inline
+    -- SETUP modes
+    if b_mode == 0 then
+        -- SETUP CAPTURE LOOP
+        mode = 1    -- force RMS values
+        while 1 == 1 loop
+            -- buttons check
+            i = debounce_fast(b_up, upst)
+            if (i == 2) then
+                -- incremento
+                if probe_gain[probe] < 65500 then
+                    probe_gain[probe] = probe_gain[probe] + 50
+                    save_probe_gain()
+                end if
+            end if
+
+            i = debounce_fast(b_down, downst)
+            if (i == 2) then
+                -- incremento
+                if probe_gain[probe] > 1000 then
+                    probe_gain[probe] = probe_gain[probe] - 50
+                    save_probe_gain()
+                end if
+            end if
+
+            -- power calcs
+            calc_power()
+
+            -- Display update, 4 veces por segundo
+            if (check_delay(0)) then
+                set_delay(0, 250)      -- 1 Khz tics, aka 4/s
+                show_it()
+                -- show SETUP
+                show_setup()
+            end if
+        end loop
+    end if
+end procedure
+
+
+-- set alc negative voltage to a value, 0 is to disable (0-1023)
+procedure set_alc(word in val) is
+    -- set it
+    pwm1_set_dutycycle_ratio(val)
+
+    -- set to zero
+    if (val == 0) then
+        -- shutoff
+        pwm1_off()
+    else
+        -- enable
+        pwm1_on()
+    end if
+end procedure
+
+
+-- Icom Tune procedure
+procedure icom_tune() is
+    pragma inline
+    -- The procedure is as follows
+    -- Tune button is pressed
+    --  * icom_start is asserted for more than 50 msec
+    --  * we wait for icom_key to go down
+    --  * once it's down (-16dB attenuator on place, SWR 1:1)
+    --  * apply PTT and activate the ALC control loop
+
+    -- check for tune button press
+    i = debounce_fast(b_tune, tunest)
+    if (i == 2) then
+        -- tune begin
+
+        -- icom start is inverted to trigger a transistor
+        -- Against the logic of the tuner
+        -- 0 is off / 1 is on
+
+        -- do the > 50 msec pulse
+        istart = 1
+        delay_1ms(7)
+        istart = 0
+
+        -- start ALC control loop to asure ~10W of power and PTT
+        alc_control = 1
+    end if
+
+    -- check for icom_key status
+    i = debounce_fast(ikey, ikeyst)
+
+    -- go down
+    if (i == 2) then
+        -- Tuner request trx to go TX, so...
+
+        -- apply TX
+        trx_ptt = 1
+
+        -- activate alc control loop
+        alc_control = 1
+    end if
+
+    -- go up
+    if (i == 3) then
+        -- Tuner request trx to go RX, so...
+
+        -- apply TX
+        trx_ptt = 0
+
+        -- activate alc control loop
+        alc_control = 0
+        alcval = 0
+    end if
+end procedure
+
+
+-- alc control loop
+procedure alc_loop() is
+    pragma inline
+    -- Mission is to maintain the power between 10 and 15W via ALC control
+    --
+    -- As we have the "rmsfwd" (rms forward power) in the environment
+    -- we can tune the ALC to keep it between 10 - 15 W
+    --
+    -- ALC 0 is full power, rms is in W * 100
+
+    -- get the power now
+    i = byte(rmsfwd / 100)
+
+    -- power to low
+    if (i < 10 & alcval != 0) then
+        -- decrease the alcval
+        alcval = alcval - 1
+    end if
+
+    -- power to high
+    if (i > 15 & alcval < 1020) then
+        -- decrease the alcval
+        alcval = alcval + 1
+    end if
+
+    -- set the value
+    set_alc(alcval)
+end procedure
+
+-- serial check
+procedure check_serial() is
+    pragma inline
+
+    -- local vars
+    var bit sflag = 0
+    var byte char
+
+    -- check for a carriage return
+    sflag = serial_hw_read(char)
+    if (sflag == 1 & char == 13) then
+        -- send the data via serial
+
+        -- data format is: (values are V * 100)
+        -- pif, pir, rmsf, rmsr, pepf, pepr, swr
+        -- separated by ":" fro easy spliting on the other end
+
+        -- instantaneous values
+        format_dword_dec(serial_hw_data, pfwd, 6, 3)
+        serial_hw_data = ":"
+        format_dword_dec(serial_hw_data, prev, 6, 3)
+        serial_hw_data = ":"
+
+        -- rms values
+        format_dword_dec(serial_hw_data, rmsfwd, 6, 3)
+        serial_hw_data = ":"
+        format_dword_dec(serial_hw_data, rmsrev, 6, 3)
+        serial_hw_data = ":"
+
+        -- peak values
+        format_dword_dec(serial_hw_data, pepfwd, 6, 3)
+        serial_hw_data = ":"
+        format_dword_dec(serial_hw_data, peprev, 6, 3)
+        serial_hw_data = ":"
+
+        -- SWR
+        format_word_dec(serial_hw_data, swr, 4, 2)
+
+        -- carriage return
+        serial_hw_data = "\n"
+    end if
+end procedure
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+
+-- test which probe is attached
+probe = test_probe()
+
+-- load eeprom data, or reset it if needed
+init_eeprom()
+
+-- set the vars for the actual probe
+probe_changed()
+
+-- capture the setup configuration
+in_setup()
+
+-- forever loop
+forever loop
+    -- Display update, 4 veces por segundo
+    if (check_delay(0)) then
+        set_delay(0, 250)      -- 1 Khz tics, aka 4/s
+
+        -- show data
+        show_it()
+
+        -- check for a probe change
+        i = test_probe()
+        if (i != probe) then
+            probe_changed()
+        end if
+    end if
+
+    -- Lectura de valores, 5 veces por segundo
+    -- hay que tomar en cuenta el tiempo de sampling del ADC
+    if (check_delay(1)) then
+        set_delay(1, 100)
+
+        -- power calculations
+        calc_power()
+
+        -- show the power bar
+        show_bar()
+    end if
+
+    -- botones
+    if (debounce(b_mode, modest) == 2) then
+        -- cambio de modo
+        if mode == 2 then
+            mode = 0
+        else
+            mode = mode + 1
+        end if
+    end if
+
+    -- Tune routine, Icom's AT-130/140 (AH-3/AH-4) way
+    icom_tune()
+
+    -- alc loop
+    if (alc_control == 1) then
+        -- check for power
+        alc_loop()
+    else
+        -- get sure ALC is disabled for good
+        if (alcval != 0) then
+            -- set to zero and disable
+            alcval = 0
+            set_alc(alcval)
+        end if
+    end if
+
+    -- serial check
+    check_serial()
+end loop
