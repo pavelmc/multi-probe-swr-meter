@@ -2,3 +2,5 @@
 *.xcf
 *.*bak
 ~*
+*.asm
+*.cod
